@@ -1,0 +1,535 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/com/example/autopot src/main/resources src/main/resources/assets/autopot/lang
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'autopot'
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.4
+          loader_version=0.18.4
+          fabric_version=0.141.3+1.21.11
+          loom_version=1.14-SNAPSHOT
+
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=autopot
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              maven {
+                  name = 'Fabric'
+                  url = 'https://maven.fabricmc.net/'
+              }
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+              it.options.encoding = "UTF-8"
+          }
+          EOF
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "autopot",
+            "version": "${version}",
+            "name": "AutoPot",
+            "description": "Авто-бафф и авто-хил взрывными зельями. Вкл/выкл: G.",
+            "authors": ["Custom"],
+            "contact": {},
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": [
+                "com.example.autopot.AutoPotMod"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+          cat > src/main/resources/assets/autopot/lang/en_us.json <<'EOF'
+          {
+            "key.autopot.toggle": "AutoPot on/off",
+            "key.category.autopot.main": "AutoPot"
+          }
+          EOF
+          cat > src/main/resources/assets/autopot/lang/ru_ru.json <<'EOF'
+          {
+            "key.autopot.toggle": "AutoPot: вкл/выкл",
+            "key.category.autopot.main": "AutoPot"
+          }
+          EOF
+          cat > src/main/java/com/example/autopot/AutoPotMod.java <<'EOF'
+          package com.example.autopot;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.PotionContentsComponent;
+          import net.minecraft.entity.effect.StatusEffect;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.entity.effect.StatusEffects;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.entry.RegistryEntry;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          /**
+           * AutoPot. Следит за эффектами и сам кидает взрывные зелья себе под ноги:
+           *   1) Сила / Скорость / Огнестойкость — когда до конца эффекта остаётся BUFF_SECONDS секунд (или эффекта нет);
+           *   2) Исцеление — когда HP <= HEAL_HEARTS сердец (смотрит вниз и кидает под себя);
+           *   3) Если зелья лежат в инвентаре — временно ставит их в слоты 7/8/9 хотбара, кидает
+           *      и возвращает на место те вещи, что там были.
+           *
+           * Вкл/выкл: G. Команды: .bind pot <клавиша>, .pot hp <сердца>, .pot buff <секунды>
+           */
+          public class AutoPotMod implements ClientModInitializer {
+
+              private enum Kind { HEAL, STRENGTH, SPEED, FIRE }
+
+              // ===== Настройки (меняются командами) =====
+              private static double healHearts = 4.0;   // кидаем исцеление, когда HP <= этого числа сердец
+              private static int buffSeconds = 10;      // обновляем бафф, когда осталось <= этого числа секунд
+
+              private static final int HEAL_COOLDOWN = 10;   // тиков между исцелениями
+              private static final int BUFF_COOLDOWN = 60;   // тиков между повторными бросками одного баффа
+              private static final int CHECK_PERIOD = 5;     // как часто проверять баффы (тики)
+
+              static boolean enabled = false;
+
+              private static KeyBinding toggleKey;
+
+              private static boolean throwPending = false;
+              private static Kind job = null;
+              private static int throwSlot = -1;
+              private static int swapSrc = -1;    // откуда брали зелье в инвентаре (-1 — зелье уже было в хотбаре)
+              private static int swapTmp = -1;    // слот хотбара (0..8), куда временно положили зелье
+              private static int savedSlot = -1;
+              private static float savedPitch = 0.0f;
+              private static final int[] cooldown = new int[Kind.values().length];
+              private static int checkTimer = 0;
+              private static int statusTimer = 0;
+
+              @Override
+              public void onInitializeClient() {
+                  KeyBinding.Category category = KeyBinding.Category.create(Identifier.of("autopot", "main"));
+                  toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.autopot.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_G, category));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(AutoPotMod::tick);
+                  ClientSendMessageEvents.ALLOW_CHAT.register(message -> !handleCommand(message));
+              }
+
+              // ================= Основной цикл =================
+
+              private static void tick(MinecraftClient client) {
+                  while (toggleKey.wasPressed()) {
+                      setEnabled(client, !enabled);
+                  }
+                  for (int i = 0; i < cooldown.length; i++) {
+                      if (cooldown[i] > 0) {
+                          cooldown[i]--;
+                      }
+                  }
+
+                  ClientPlayerEntity player = client.player;
+                  if (player == null || client.world == null || client.interactionManager == null) {
+                      reset();
+                      return;
+                  }
+                  if (!enabled) {
+                      return;
+                  }
+
+                  // Вторая фаза: бросок (зелье уже в руке, взгляд вниз).
+                  if (throwPending) {
+                      finishThrow(client, player, client.currentScreen == null && player.isAlive());
+                      return;
+                  }
+                  if (client.currentScreen != null || !player.isAlive()) {
+                      return;
+                  }
+
+                  showStatus(player);
+
+                  Kind next = null;
+                  if (player.getHealth() <= healHearts * 2.0 && cooldown[Kind.HEAL.ordinal()] == 0
+                          && findPotion(player, Kind.HEAL) != -1) {
+                      next = Kind.HEAL;
+                  } else if (!player.isUsingItem() && ++checkTimer >= CHECK_PERIOD) {
+                      checkTimer = 0;
+                      for (Kind k : new Kind[]{Kind.STRENGTH, Kind.SPEED, Kind.FIRE}) {
+                          if (cooldown[k.ordinal()] == 0 && needsBuff(player, k) && findPotion(player, k) != -1) {
+                              next = k;
+                              break;
+                          }
+                      }
+                  }
+                  if (next != null) {
+                      prepare(client, player, next);
+                  }
+              }
+
+              /** Фаза 1: достаём зелье в хотбар (если надо), выбираем слот и смотрим вниз. */
+              private static void prepare(MinecraftClient client, ClientPlayerEntity player, Kind kind) {
+                  int idx = findPotion(player, kind);
+                  if (idx == -1) {
+                      return;
+                  }
+                  savedSlot = player.getInventory().getSelectedSlot();
+                  savedPitch = player.getPitch();
+                  swapSrc = -1;
+                  swapTmp = -1;
+
+                  if (idx >= 9) {
+                      // Зелье в инвентаре: меняем местами с одним из слотов 7/8/9 (индексы 6/7/8).
+                      int tmp = tempSlotOf(kind);
+                      client.interactionManager.clickSlot(player.playerScreenHandler.syncId, idx, tmp,
+                              SlotActionType.SWAP, player);
+                      swapSrc = idx;
+                      swapTmp = tmp;
+                      throwSlot = tmp;
+                  } else {
+                      throwSlot = idx;
+                  }
+
+                  player.getInventory().setSelectedSlot(throwSlot);
+                  player.setPitch(90.0f); // смотрим строго вниз — зелье падает под ноги
+                  job = kind;
+                  throwPending = true;
+              }
+
+              /** Фаза 2: бросаем (или отменяем) и возвращаем всё как было. */
+              private static void finishThrow(MinecraftClient client, ClientPlayerEntity player, boolean doThrow) {
+                  if (doThrow && job != null && player.getInventory().getStack(throwSlot).isOf(Items.SPLASH_POTION)) {
+                      player.setPitch(90.0f);
+                      client.interactionManager.interactItem(player, Hand.MAIN_HAND);
+                      player.swingHand(Hand.MAIN_HAND);
+                      cooldown[job.ordinal()] = job == Kind.HEAL ? HEAL_COOLDOWN : BUFF_COOLDOWN;
+                  }
+                  player.setPitch(savedPitch);
+                  if (swapSrc != -1) {
+                      // Возвращаем на место вещь, которая стояла в хотбаре (остатки зелий уходят обратно в инвентарь).
+                      client.interactionManager.clickSlot(player.playerScreenHandler.syncId, swapSrc, swapTmp,
+                              SlotActionType.SWAP, player);
+                  }
+                  if (savedSlot != -1) {
+                      player.getInventory().setSelectedSlot(savedSlot);
+                  }
+                  throwPending = false;
+                  job = null;
+                  swapSrc = -1;
+                  swapTmp = -1;
+                  savedSlot = -1;
+              }
+
+              // ================= Логика зелий =================
+
+              private static boolean needsBuff(ClientPlayerEntity player, Kind kind) {
+                  StatusEffectInstance inst = player.getStatusEffect(effectOf(kind));
+                  if (inst == null) {
+                      return true;
+                  }
+                  int d = inst.getDuration();
+                  if (d < 0) {
+                      return false; // бесконечный эффект
+                  }
+                  return d <= buffSeconds * 20;
+              }
+
+              private static RegistryEntry<StatusEffect> effectOf(Kind kind) {
+                  return switch (kind) {
+                      case HEAL -> StatusEffects.INSTANT_HEALTH;
+                      case STRENGTH -> StatusEffects.STRENGTH;
+                      case SPEED -> StatusEffects.SPEED;
+                      case FIRE -> StatusEffects.FIRE_RESISTANCE;
+                  };
+              }
+
+              /** В какой слот хотбара (0..8) временно кладём зелье: 7-й, 8-й и 9-й. */
+              private static int tempSlotOf(Kind kind) {
+                  return switch (kind) {
+                      case STRENGTH -> 6;
+                      case SPEED -> 7;
+                      case FIRE, HEAL -> 8;
+                  };
+              }
+
+              /** Ищем взрывное зелье нужного типа: сначала в хотбаре (0..8), потом в инвентаре (9..35). */
+              private static int findPotion(ClientPlayerEntity player, Kind kind) {
+                  RegistryEntry<StatusEffect> effect = effectOf(kind);
+                  for (int i = 0; i < 36; i++) {
+                      if (hasEffect(player.getInventory().getStack(i), effect)) {
+                          return i;
+                      }
+                  }
+                  return -1;
+              }
+
+              private static boolean hasEffect(ItemStack stack, RegistryEntry<StatusEffect> effect) {
+                  if (!stack.isOf(Items.SPLASH_POTION)) {
+                      return false;
+                  }
+                  PotionContentsComponent contents = stack.get(DataComponentTypes.POTION_CONTENTS);
+                  if (contents == null) {
+                      return false;
+                  }
+                  for (StatusEffectInstance inst : contents.getEffects()) {
+                      if (inst.getEffectType().equals(effect)) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              // ================= Состояние =================
+
+              static void setEnabled(MinecraftClient client, boolean value) {
+                  enabled = value;
+                  if (!value) {
+                      reset();
+                  }
+                  statusTimer = 0;
+                  if (client.player != null) {
+                      client.player.sendMessage(Text.literal(value
+                              ? "§7[AutoPot] §aВКЛЮЧЁН"
+                              : "§7[AutoPot] §cВЫКЛЮЧЕН"), true);
+                  }
+              }
+
+              private static void reset() {
+                  throwPending = false;
+                  job = null;
+                  swapSrc = -1;
+                  swapTmp = -1;
+                  savedSlot = -1;
+                  checkTimer = 0;
+              }
+
+              private static void showStatus(ClientPlayerEntity player) {
+                  if (++statusTimer >= 30) {
+                      statusTimer = 0;
+                      player.sendMessage(Text.literal("§7[AutoPot] §aВКЛ §7| хил при §f" + trim(healHearts)
+                              + "♥ §7| бафф за §f" + buffSeconds + " с"), true);
+                  }
+              }
+
+              private static String trim(double v) {
+                  return v == Math.floor(v) ? String.valueOf((int) v) : String.valueOf(v);
+              }
+
+              // ================= Команды =================
+
+              private static final String RU_LAYOUT = "йцукенгшщзфывапролдячсмить";
+              private static final String EN_LAYOUT = "qwertyuiopasdfghjklzxcvbnm";
+
+              private static boolean handleCommand(String message) {
+                  String[] args = message.trim().split("\\s+");
+                  if (args.length < 1) {
+                      return false;
+                  }
+                  MinecraftClient client = MinecraftClient.getInstance();
+
+                  // .pot hp <сердца> / .pot buff <секунды>
+                  if (args[0].equalsIgnoreCase(".pot")) {
+                      if (args.length >= 3 && args[1].equalsIgnoreCase("hp")) {
+                          try {
+                              double v = Double.parseDouble(args[2].replace(',', '.'));
+                              healHearts = Math.max(0.5, Math.min(20.0, v));
+                              feedback(client, "§7[AutoPot] Хил при HP <= §a" + trim(healHearts) + " §7сердец");
+                          } catch (NumberFormatException e) {
+                              feedback(client, "§7[AutoPot] §cНужно число: §f.pot hp 4");
+                          }
+                          return true;
+                      }
+                      if (args.length >= 3 && args[1].equalsIgnoreCase("buff")) {
+                          try {
+                              buffSeconds = Math.max(1, Math.min(60, Integer.parseInt(args[2])));
+                              feedback(client, "§7[AutoPot] Бафф обновляется за §a" + buffSeconds + " §7с до конца");
+                          } catch (NumberFormatException e) {
+                              feedback(client, "§7[AutoPot] §cНужно число: §f.pot buff 10");
+                          }
+                          return true;
+                      }
+                      feedback(client, "§7[AutoPot] §f.pot hp <сердца> §7| §f.pot buff <секунды> §7| §f.bind pot <клавиша>");
+                      return true;
+                  }
+
+                  // .bind pot <клавиша>
+                  if (args.length >= 2 && args[0].equalsIgnoreCase(".bind") && args[1].equalsIgnoreCase("pot")) {
+                      if (args.length < 3) {
+                          feedback(client, "§7[AutoPot] Использование: §f.bind pot <клавиша>");
+                          return true;
+                      }
+                      StringBuilder sb = new StringBuilder();
+                      for (int a = 2; a < args.length; a++) {
+                          sb.append(a > 2 ? "." : "").append(args[a]);
+                      }
+                      String raw = sb.toString().replace("\"", "").replace("'", "").replace("\u201c", "")
+                              .replace("\u201d", "").toLowerCase();
+                      InputUtil.Key key = parseKey(raw);
+                      if (key == null) {
+                          feedback(client, "§7[AutoPot] §cНеизвестная клавиша: §f" + raw
+                                  + " §7(примеры: g, f6, shift, ctrl, alt, space, mouse4, mouse5)");
+                          return true;
+                      }
+                      toggleKey.setBoundKey(key);
+                      KeyBinding.updateKeysByCode();
+                      client.options.write();
+                      feedback(client, "§7[AutoPot] Клавиша: §a" + toggleKey.getBoundKeyLocalizedText().getString());
+                      return true;
+                  }
+                  return false;
+              }
+
+              private static InputUtil.Key parseKey(String raw) {
+                  if (raw.isEmpty()) {
+                      return null;
+                  }
+                  if (raw.equals("none") || raw.equals("unbind")) {
+                      return InputUtil.UNKNOWN_KEY;
+                  }
+                  if (raw.length() == 1) {
+                      int idx = RU_LAYOUT.indexOf(raw.charAt(0));
+                      if (idx >= 0) {
+                          raw = String.valueOf(EN_LAYOUT.charAt(idx));
+                      }
+                  }
+                  String mouse = null;
+                  switch (raw) {
+                      case "mouse1", "lmb", "leftmouse" -> mouse = "left";
+                      case "mouse2", "rmb", "rightmouse" -> mouse = "right";
+                      case "mouse3", "mmb", "middlemouse", "mouse.middle" -> mouse = "middle";
+                      case "mouse4", "mouse.4" -> mouse = "4";
+                      case "mouse5", "mouse.5" -> mouse = "5";
+                      case "mouse6" -> mouse = "6";
+                      case "mouse7" -> mouse = "7";
+                      case "mouse8" -> mouse = "8";
+                      default -> { }
+                  }
+                  try {
+                      if (mouse != null) {
+                          return InputUtil.fromTranslationKey("key.mouse." + mouse);
+                      }
+                      String name = switch (raw) {
+                          case "shift", "lshift" -> "left.shift";
+                          case "rshift" -> "right.shift";
+                          case "ctrl", "control", "lctrl" -> "left.control";
+                          case "rctrl" -> "right.control";
+                          case "alt", "lalt" -> "left.alt";
+                          case "ralt" -> "right.alt";
+                          case "caps", "capslock" -> "caps.lock";
+                          case "esc" -> "escape";
+                          case "return" -> "enter";
+                          case "del" -> "delete";
+                          case "ins" -> "insert";
+                          case "pgup" -> "page.up";
+                          case "pgdn" -> "page.down";
+                          case "grave", "tilde", "ё" -> "grave.accent";
+                          default -> raw;
+                      };
+                      if (name.startsWith("numpad")) {
+                          name = "keypad." + name.substring(6);
+                      }
+                      return InputUtil.fromTranslationKey("key.keyboard." + name);
+                  } catch (RuntimeException e) {
+                      return null;
+                  }
+              }
+
+              private static void feedback(MinecraftClient client, String text) {
+                  if (client.player != null) {
+                      client.player.sendMessage(Text.literal(text), false);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle build --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autopot-jar
+          path: build/libs/*.jar
