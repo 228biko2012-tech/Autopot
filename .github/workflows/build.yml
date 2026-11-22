@@ -160,7 +160,7 @@ jobs:
            * AutoPot. Следит за эффектами и сам кидает взрывные зелья себе под ноги:
            *   1) Сила / Скорость / Огнестойкость — когда до конца эффекта остаётся BUFF_SECONDS секунд (или эффекта нет);
            *   2) Исцеление — когда HP <= HEAL_HEARTS сердец (смотрит вниз и кидает под себя);
-           *      Камера опускается и возвращается плавно, без рывков.
+           *      Камера опускается и возвращается как у человека: плавный разгон, случайная скорость, лёгкая дрожь.
            *   3) Если зелья лежат в инвентаре — временно ставит их в слоты 7/8/9 хотбара, кидает
            *      и возвращает на место те вещи, что там были.
            *
@@ -180,15 +180,8 @@ jobs:
               private static final int BUFF_COOLDOWN = 60;   // тиков между повторными бросками одного баффа
               private static final int CHECK_PERIOD = 5;     // как часто проверять баффы (тики)
 
-              // Плавность камеры (чем меньше SMOOTH — тем плавнее и медленнее; MAX_STEP — потолок градусов за тик)
-              private static final float BUFF_SMOOTH = 0.28f;
-              private static final float BUFF_MAX_STEP = 18.0f;
-              private static final float HEAL_SMOOTH = 0.5f;     // исцеление чуть быстрее — это срочно
-              private static final float HEAL_MAX_STEP = 30.0f;
-              private static final float RETURN_SMOOTH = 0.3f;
-              private static final float RETURN_MAX_STEP = 15.0f;
-              private static final float MIN_STEP = 3.0f;
-              private static final int MAX_AIM_TICKS = 16;       // если за столько тиков не опустились — отмена
+              // «Человеческая» камера: плавный разгон/торможение, случайная длительность, лёгкая дрожь и неточность.
+              private static final java.util.Random RNG = new java.util.Random();
 
               static boolean enabled = false;
 
@@ -202,6 +195,15 @@ jobs:
               private static int swapTmp = -1;    // слот хотбара (0..8), куда временно положили зелье
               private static int savedSlot = -1;
               private static float savedPitch = 0.0f;
+              private static float savedPitchBackup = 0.0f;
+              private static float aimStart = 0.0f;
+              private static float aimTarget = 90.0f;
+              private static int aimDur = 8;
+              private static int aimDelay = 0;
+              private static int holdLeft = -1;
+              private static float moveFrom = 0.0f;
+              private static float moveTo = 0.0f;
+              private static int moveDur = 7;
               private static final int[] cooldown = new int[Kind.values().length];
               private static int checkTimer = 0;
               private static int statusTimer = 0;
@@ -278,6 +280,7 @@ jobs:
                   }
                   savedSlot = player.getInventory().getSelectedSlot();
                   savedPitch = player.getPitch();
+                  savedPitchBackup = savedPitch;
                   swapSrc = -1;
                   swapTmp = -1;
 
@@ -296,31 +299,52 @@ jobs:
                   player.getInventory().setSelectedSlot(throwSlot);
                   job = kind;
                   phaseTicks = 0;
+                  holdLeft = -1;
+                  boolean heal = kind == Kind.HEAL;
+                  // Как человек: у каждого броска свой угол, своя скорость и небольшая пауза «на реакцию».
+                  aimStart = savedPitch;
+                  aimTarget = Math.min(90.0f, Math.max(savedPitch, heal ? 87.0f + RNG.nextFloat() * 3.0f : 84.0f + RNG.nextFloat() * 5.0f));
+                  aimDur = heal ? 4 + RNG.nextInt(2) : 7 + RNG.nextInt(4);
+                  aimDelay = heal ? 0 : RNG.nextInt(3);
                   phase = Phase.AIM; // камеру опускаем плавно в aimStep
               }
 
-              /** Плавно опускаем взгляд вниз; как только смотрим вниз — бросаем. */
+              /** Плавный разгон и торможение (smootherstep), как у живой руки. */
+              private static float ease(float t) {
+                  t = MathHelper.clamp(t, 0.0f, 1.0f);
+                  return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+              }
+
+              /** Опускаем взгляд вниз по кривой; у цели чуть «замираем» и только потом бросаем. */
               private static void aimStep(MinecraftClient client, ClientPlayerEntity player) {
                   if (client.currentScreen != null || !player.isAlive() || job == null) {
                       restoreItems(client, player);
                       phase = Phase.IDLE;
                       return;
                   }
-                  float pitch = player.getPitch();
-                  phaseTicks++;
-                  if (pitch >= 88.0f || phaseTicks > MAX_AIM_TICKS) {
-                      throwNow(client, player, pitch);
+                  if (aimDelay > 0) {
+                      aimDelay--;
                       return;
                   }
-                  boolean heal = job == Kind.HEAL;
-                  float diff = 90.0f - pitch;
-                  float step = MathHelper.clamp(diff * (heal ? HEAL_SMOOTH : BUFF_SMOOTH), MIN_STEP, heal ? HEAL_MAX_STEP : BUFF_MAX_STEP);
-                  player.setPitch(pitch + Math.min(step, diff));
+                  phaseTicks++;
+                  float t = phaseTicks / (float) aimDur;
+                  player.setPitch(aimStart + (aimTarget - aimStart) * ease(t));
+                  if (t < 1.0f) {
+                      player.setYaw(player.getYaw() + (RNG.nextFloat() - 0.5f) * 0.8f); // лёгкая дрожь руки
+                      return;
+                  }
+                  if (holdLeft < 0) {
+                      holdLeft = job == Kind.HEAL ? 0 : 1 + RNG.nextInt(2);
+                  }
+                  if (holdLeft > 0) {
+                      holdLeft--;
+                      return;
+                  }
+                  throwNow(client, player, player.getPitch());
               }
 
               private static void throwNow(MinecraftClient client, ClientPlayerEntity player, float pitch) {
                   if (pitch >= 80.0f && player.getInventory().getStack(throwSlot).isOf(Items.SPLASH_POTION)) {
-                      player.setPitch(90.0f);
                       client.interactionManager.interactItem(player, Hand.MAIN_HAND);
                       player.swingHand(Hand.MAIN_HAND);
                       cooldown[job.ordinal()] = job == Kind.HEAL ? HEAL_COOLDOWN : BUFF_COOLDOWN;
@@ -328,23 +352,22 @@ jobs:
                       cooldown[job.ordinal()] = 20; // не успели опустить взгляд — не кидаем в сторону
                   }
                   restoreItems(client, player);
+                  moveFrom = player.getPitch();
+                  moveTo = MathHelper.clamp(savedPitchBackup + (RNG.nextFloat() - 0.5f) * 3.0f, -90.0f, 90.0f);
+                  moveDur = 6 + RNG.nextInt(4);
                   phaseTicks = 0;
                   phase = Phase.RETURN;
               }
 
-              /** Плавно возвращаем взгляд на прежний наклон. */
+              /** Возвращаем взгляд на прежний наклон тоже по кривой и с небольшой неточностью, как человек. */
               private static void returnStep(ClientPlayerEntity player) {
-                  float pitch = player.getPitch();
-                  float diff = savedPitch - pitch;
                   phaseTicks++;
-                  if (Math.abs(diff) <= 1.5f || phaseTicks > 12) {
-                      player.setPitch(savedPitch);
+                  float t = phaseTicks / (float) moveDur;
+                  player.setPitch(moveFrom + (moveTo - moveFrom) * ease(t));
+                  if (t >= 1.0f) {
                       phase = Phase.IDLE;
                       job = null;
-                      return;
                   }
-                  float step = MathHelper.clamp(Math.abs(diff) * RETURN_SMOOTH, MIN_STEP, RETURN_MAX_STEP);
-                  player.setPitch(pitch + Math.signum(diff) * Math.min(step, Math.abs(diff)));
               }
 
               /** Возвращаем вещи: выбранный слот и (если брали из инвентаря) то, что стояло в хотбаре. */
