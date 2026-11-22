@@ -153,12 +153,14 @@ jobs:
           import net.minecraft.text.Text;
           import net.minecraft.util.Hand;
           import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.MathHelper;
           import org.lwjgl.glfw.GLFW;
 
           /**
            * AutoPot. Следит за эффектами и сам кидает взрывные зелья себе под ноги:
            *   1) Сила / Скорость / Огнестойкость — когда до конца эффекта остаётся BUFF_SECONDS секунд (или эффекта нет);
            *   2) Исцеление — когда HP <= HEAL_HEARTS сердец (смотрит вниз и кидает под себя);
+           *      Камера опускается и возвращается плавно, без рывков.
            *   3) Если зелья лежат в инвентаре — временно ставит их в слоты 7/8/9 хотбара, кидает
            *      и возвращает на место те вещи, что там были.
            *
@@ -168,6 +170,8 @@ jobs:
 
               private enum Kind { HEAL, STRENGTH, SPEED, FIRE }
 
+              private enum Phase { IDLE, AIM, RETURN }
+
               // ===== Настройки (меняются командами) =====
               private static double healHearts = 4.0;   // кидаем исцеление, когда HP <= этого числа сердец
               private static int buffSeconds = 10;      // обновляем бафф, когда осталось <= этого числа секунд
@@ -176,11 +180,22 @@ jobs:
               private static final int BUFF_COOLDOWN = 60;   // тиков между повторными бросками одного баффа
               private static final int CHECK_PERIOD = 5;     // как часто проверять баффы (тики)
 
+              // Плавность камеры (чем меньше SMOOTH — тем плавнее и медленнее; MAX_STEP — потолок градусов за тик)
+              private static final float BUFF_SMOOTH = 0.28f;
+              private static final float BUFF_MAX_STEP = 18.0f;
+              private static final float HEAL_SMOOTH = 0.5f;     // исцеление чуть быстрее — это срочно
+              private static final float HEAL_MAX_STEP = 30.0f;
+              private static final float RETURN_SMOOTH = 0.3f;
+              private static final float RETURN_MAX_STEP = 15.0f;
+              private static final float MIN_STEP = 3.0f;
+              private static final int MAX_AIM_TICKS = 16;       // если за столько тиков не опустились — отмена
+
               static boolean enabled = false;
 
               private static KeyBinding toggleKey;
 
-              private static boolean throwPending = false;
+              private static Phase phase = Phase.IDLE;
+              private static int phaseTicks = 0;
               private static Kind job = null;
               private static int throwSlot = -1;
               private static int swapSrc = -1;    // откуда брали зелье в инвентаре (-1 — зелье уже было в хотбаре)
@@ -222,9 +237,13 @@ jobs:
                       return;
                   }
 
-                  // Вторая фаза: бросок (зелье уже в руке, взгляд вниз).
-                  if (throwPending) {
-                      finishThrow(client, player, client.currentScreen == null && player.isAlive());
+                  // Плавный наклон камеры вниз -> бросок -> плавный возврат.
+                  if (phase == Phase.AIM) {
+                      aimStep(client, player);
+                      return;
+                  }
+                  if (phase == Phase.RETURN) {
+                      returnStep(player);
                       return;
                   }
                   if (client.currentScreen != null || !player.isAlive()) {
@@ -275,30 +294,68 @@ jobs:
                   }
 
                   player.getInventory().setSelectedSlot(throwSlot);
-                  player.setPitch(90.0f); // смотрим строго вниз — зелье падает под ноги
                   job = kind;
-                  throwPending = true;
+                  phaseTicks = 0;
+                  phase = Phase.AIM; // камеру опускаем плавно в aimStep
               }
 
-              /** Фаза 2: бросаем (или отменяем) и возвращаем всё как было. */
-              private static void finishThrow(MinecraftClient client, ClientPlayerEntity player, boolean doThrow) {
-                  if (doThrow && job != null && player.getInventory().getStack(throwSlot).isOf(Items.SPLASH_POTION)) {
+              /** Плавно опускаем взгляд вниз; как только смотрим вниз — бросаем. */
+              private static void aimStep(MinecraftClient client, ClientPlayerEntity player) {
+                  if (client.currentScreen != null || !player.isAlive() || job == null) {
+                      restoreItems(client, player);
+                      phase = Phase.IDLE;
+                      return;
+                  }
+                  float pitch = player.getPitch();
+                  phaseTicks++;
+                  if (pitch >= 88.0f || phaseTicks > MAX_AIM_TICKS) {
+                      throwNow(client, player, pitch);
+                      return;
+                  }
+                  boolean heal = job == Kind.HEAL;
+                  float diff = 90.0f - pitch;
+                  float step = MathHelper.clamp(diff * (heal ? HEAL_SMOOTH : BUFF_SMOOTH), MIN_STEP, heal ? HEAL_MAX_STEP : BUFF_MAX_STEP);
+                  player.setPitch(pitch + Math.min(step, diff));
+              }
+
+              private static void throwNow(MinecraftClient client, ClientPlayerEntity player, float pitch) {
+                  if (pitch >= 80.0f && player.getInventory().getStack(throwSlot).isOf(Items.SPLASH_POTION)) {
                       player.setPitch(90.0f);
                       client.interactionManager.interactItem(player, Hand.MAIN_HAND);
                       player.swingHand(Hand.MAIN_HAND);
                       cooldown[job.ordinal()] = job == Kind.HEAL ? HEAL_COOLDOWN : BUFF_COOLDOWN;
+                  } else {
+                      cooldown[job.ordinal()] = 20; // не успели опустить взгляд — не кидаем в сторону
                   }
-                  player.setPitch(savedPitch);
+                  restoreItems(client, player);
+                  phaseTicks = 0;
+                  phase = Phase.RETURN;
+              }
+
+              /** Плавно возвращаем взгляд на прежний наклон. */
+              private static void returnStep(ClientPlayerEntity player) {
+                  float pitch = player.getPitch();
+                  float diff = savedPitch - pitch;
+                  phaseTicks++;
+                  if (Math.abs(diff) <= 1.5f || phaseTicks > 12) {
+                      player.setPitch(savedPitch);
+                      phase = Phase.IDLE;
+                      job = null;
+                      return;
+                  }
+                  float step = MathHelper.clamp(Math.abs(diff) * RETURN_SMOOTH, MIN_STEP, RETURN_MAX_STEP);
+                  player.setPitch(pitch + Math.signum(diff) * Math.min(step, Math.abs(diff)));
+              }
+
+              /** Возвращаем вещи: выбранный слот и (если брали из инвентаря) то, что стояло в хотбаре. */
+              private static void restoreItems(MinecraftClient client, ClientPlayerEntity player) {
                   if (swapSrc != -1) {
-                      // Возвращаем на место вещь, которая стояла в хотбаре (остатки зелий уходят обратно в инвентарь).
                       client.interactionManager.clickSlot(player.playerScreenHandler.syncId, swapSrc, swapTmp,
                               SlotActionType.SWAP, player);
                   }
                   if (savedSlot != -1) {
                       player.getInventory().setSelectedSlot(savedSlot);
                   }
-                  throwPending = false;
-                  job = null;
                   swapSrc = -1;
                   swapTmp = -1;
                   savedSlot = -1;
@@ -368,6 +425,9 @@ jobs:
               static void setEnabled(MinecraftClient client, boolean value) {
                   enabled = value;
                   if (!value) {
+                      if (phase != Phase.IDLE && client.player != null && client.interactionManager != null) {
+                          restoreItems(client, client.player); // вернуть зелье/слот, если выключили посреди броска
+                      }
                       reset();
                   }
                   statusTimer = 0;
@@ -379,7 +439,7 @@ jobs:
               }
 
               private static void reset() {
-                  throwPending = false;
+                  phase = Phase.IDLE;
                   job = null;
                   swapSrc = -1;
                   swapTmp = -1;
@@ -446,8 +506,8 @@ jobs:
                       for (int a = 2; a < args.length; a++) {
                           sb.append(a > 2 ? "." : "").append(args[a]);
                       }
-                      String raw = sb.toString().replace("\"", "").replace("'", "").replace("\u201c", "")
-                              .replace("\u201d", "").toLowerCase();
+                      String raw = sb.toString().replace("\"", "").replace("'", "").replace("“", "")
+                              .replace("”", "").toLowerCase();
                       InputUtil.Key key = parseKey(raw);
                       if (key == null) {
                           feedback(client, "§7[AutoPot] §cНеизвестная клавиша: §f" + raw
