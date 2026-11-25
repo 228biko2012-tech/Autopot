@@ -160,7 +160,8 @@ jobs:
            * AutoPot. Следит за эффектами и сам кидает взрывные зелья себе под ноги:
            *   1) Сила / Скорость / Огнестойкость — когда до конца эффекта остаётся BUFF_SECONDS секунд (или эффекта нет);
            *   2) Исцеление — когда HP <= HEAL_HEARTS сердец (смотрит вниз и кидает под себя);
-           *      Камера опускается и возвращается как у человека: плавный разгон, случайная скорость, лёгкая дрожь.
+           *      Камера опускается и возвращается быстро, но плавно (кривая разгона/торможения, без рывков).
+           *      Несколько баффов подряд кидаются «цепочкой» без подъёма камеры между ними.
            *   3) Если зелья лежат в инвентаре — временно ставит их в слоты 7/8/9 хотбара, кидает
            *      и возвращает на место те вещи, что там были.
            *
@@ -177,10 +178,10 @@ jobs:
               private static int buffSeconds = 10;      // обновляем бафф, когда осталось <= этого числа секунд
 
               private static final int HEAL_COOLDOWN = 10;   // тиков между исцелениями
-              private static final int BUFF_COOLDOWN = 60;   // тиков между повторными бросками одного баффа
-              private static final int CHECK_PERIOD = 5;     // как часто проверять баффы (тики)
+              private static final int BUFF_COOLDOWN = 40;   // тиков между повторными бросками одного баффа
+              private static final int CHECK_PERIOD = 1;     // как часто проверять баффы (тики): каждый тик — реакция мгновенная
 
-              // «Человеческая» камера: плавный разгон/торможение, случайная длительность, лёгкая дрожь и неточность.
+              // Быстрая и плавная камера: короткий наклон по кривой разгона/торможения.
               private static final java.util.Random RNG = new java.util.Random();
 
               static boolean enabled = false;
@@ -254,33 +255,46 @@ jobs:
 
                   showStatus(player);
 
-                  Kind next = null;
-                  if (player.getHealth() <= healHearts * 2.0 && cooldown[Kind.HEAL.ordinal()] == 0
-                          && findPotion(player, Kind.HEAL) != -1) {
-                      next = Kind.HEAL;
-                  } else if (!player.isUsingItem() && ++checkTimer >= CHECK_PERIOD) {
-                      checkTimer = 0;
-                      for (Kind k : new Kind[]{Kind.STRENGTH, Kind.SPEED, Kind.FIRE}) {
-                          if (cooldown[k.ordinal()] == 0 && needsBuff(player, k) && findPotion(player, k) != -1) {
-                              next = k;
-                              break;
-                          }
-                      }
-                  }
+                  Kind next = pickNext(player, true);
                   if (next != null) {
-                      prepare(client, player, next);
+                      prepare(client, player, next, false);
                   }
               }
 
+              /** Что кидать сейчас: сначала исцеление (если мало HP), потом баффы, у которых скоро конец. */
+              private static Kind pickNext(ClientPlayerEntity player, boolean throttle) {
+                  if (player.getHealth() <= healHearts * 2.0 && cooldown[Kind.HEAL.ordinal()] == 0
+                          && findPotion(player, Kind.HEAL) != -1) {
+                      return Kind.HEAL;
+                  }
+                  if (player.isUsingItem()) {
+                      return null;
+                  }
+                  if (throttle) {
+                      if (++checkTimer < CHECK_PERIOD) {
+                          return null;
+                      }
+                      checkTimer = 0;
+                  }
+                  for (Kind k : new Kind[]{Kind.STRENGTH, Kind.SPEED, Kind.FIRE}) {
+                      if (cooldown[k.ordinal()] == 0 && needsBuff(player, k) && findPotion(player, k) != -1) {
+                          return k;
+                      }
+                  }
+                  return null;
+              }
+
               /** Фаза 1: достаём зелье в хотбар (если надо), выбираем слот и смотрим вниз. */
-              private static void prepare(MinecraftClient client, ClientPlayerEntity player, Kind kind) {
+              private static void prepare(MinecraftClient client, ClientPlayerEntity player, Kind kind, boolean chain) {
                   int idx = findPotion(player, kind);
                   if (idx == -1) {
                       return;
                   }
                   savedSlot = player.getInventory().getSelectedSlot();
-                  savedPitch = player.getPitch();
-                  savedPitchBackup = savedPitch;
+                  if (!chain) { // при «цепочке» баффов взгляд уже внизу — исходный наклон не перезаписываем
+                      savedPitch = player.getPitch();
+                      savedPitchBackup = savedPitch;
+                  }
                   swapSrc = -1;
                   swapTmp = -1;
 
@@ -301,11 +315,11 @@ jobs:
                   phaseTicks = 0;
                   holdLeft = -1;
                   boolean heal = kind == Kind.HEAL;
-                  // Как человек: у каждого броска свой угол, своя скорость и небольшая пауза «на реакцию».
-                  aimStart = savedPitch;
-                  aimTarget = Math.min(90.0f, Math.max(savedPitch, heal ? 87.0f + RNG.nextFloat() * 3.0f : 84.0f + RNG.nextFloat() * 5.0f));
-                  aimDur = heal ? 4 + RNG.nextInt(2) : 7 + RNG.nextInt(4);
-                  aimDelay = heal ? 0 : RNG.nextInt(3);
+                  // Очень быстро, но по кривой разгона/торможения (без дрожи).
+                  aimStart = player.getPitch();
+                  aimTarget = Math.min(90.0f, Math.max(aimStart, heal ? 88.0f + RNG.nextFloat() * 2.0f : 86.0f + RNG.nextFloat() * 3.0f));
+                  aimDur = chain ? 1 : 2;   // очень быстро: 2 тика на наклон, следующее зелье в цепочке — через 1 тик
+                  aimDelay = 0;
                   phase = Phase.AIM; // камеру опускаем плавно в aimStep
               }
 
@@ -329,16 +343,8 @@ jobs:
                   phaseTicks++;
                   float t = phaseTicks / (float) aimDur;
                   player.setPitch(aimStart + (aimTarget - aimStart) * ease(t));
-                  if (t < 1.0f) {
-                      player.setYaw(player.getYaw() + (RNG.nextFloat() - 0.5f) * 0.8f); // лёгкая дрожь руки
-                      return;
-                  }
-                  if (holdLeft < 0) {
-                      holdLeft = job == Kind.HEAL ? 0 : 1 + RNG.nextInt(2);
-                  }
-                  if (holdLeft > 0) {
-                      holdLeft--;
-                      return;
+                  if (t < 0.9f) {
+                      return; // ещё опускаем взгляд (кидаем, когда почти внизу — не ждём лишнего)
                   }
                   throwNow(client, player, player.getPitch());
               }
@@ -352,9 +358,15 @@ jobs:
                       cooldown[job.ordinal()] = 20; // не успели опустить взгляд — не кидаем в сторону
                   }
                   restoreItems(client, player);
+                  // Нужен ещё один бафф/хил — кидаем сразу, не поднимая камеру (так быстрее и без «качелей»).
+                  Kind more = pickNext(player, false);
+                  if (more != null) {
+                      prepare(client, player, more, true);
+                      return;
+                  }
                   moveFrom = player.getPitch();
-                  moveTo = MathHelper.clamp(savedPitchBackup + (RNG.nextFloat() - 0.5f) * 3.0f, -90.0f, 90.0f);
-                  moveDur = 6 + RNG.nextInt(4);
+                  moveTo = savedPitchBackup;
+                  moveDur = 3 + RNG.nextInt(2);
                   phaseTicks = 0;
                   phase = Phase.RETURN;
               }
